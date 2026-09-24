@@ -657,8 +657,9 @@ async def _do_mode_switch(mode_name: str) -> bool:
     fetcher = TokenFetcher(config.FRANKLIN_USERNAME, config.FRANKLIN_PASSWORD)
     client = Client(fetcher, config.FRANKLIN_GATEWAY_ID)
     
-    # Read current Storm Hedge state from the cloud so we can preserve
-    # the user's app setting across our mode switch.
+    # Read current Storm Hedge state and per-mode reserves from the cloud so
+    # the switch preserves the user's app settings.
+    sw_status = None
     try:
         sw_status = await client._switch_status()
         current_stromen = str(sw_status.get("stromEn", 0))
@@ -666,17 +667,17 @@ async def _do_mode_switch(mode_name: str) -> bool:
         log(f"  Could not read current stromEn, defaulting to '0': {e}")
         current_stromen = "0"
     
-    if mode_name == 'emergency_backup':
-        mode_obj = Mode.emergency_backup()
-        mode_obj.soc = config.RESERVE_SOC_BACKUP
-    elif mode_name == 'self_consumption':
-        mode_obj = Mode.self_consumption()
-        mode_obj.soc = config.RESERVE_SOC_HOME
-    elif mode_name == 'time_of_use':
-        mode_obj = Mode.time_of_use()
-        mode_obj.soc = config.RESERVE_SOC_HOME
-    else:
+    factories = {
+        'emergency_backup': Mode.emergency_backup,
+        'self_consumption': Mode.self_consumption,
+        'time_of_use': Mode.time_of_use,
+    }
+    if mode_name not in factories:
         raise ValueError(f"Unknown mode: {mode_name}")
+    from data_sources import preserved_mode_soc
+    soc, soc_source = preserved_mode_soc(mode_name, sw_status)
+    mode_obj = factories[mode_name](soc=soc)
+    log(f"  Mode switch to {mode_name}: reserve {soc}% from {soc_source}")
     
     mode_obj._stromen_preserve = current_stromen
     await client.set_mode(mode_obj)

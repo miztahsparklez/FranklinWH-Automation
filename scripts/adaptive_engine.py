@@ -71,15 +71,6 @@ MIN_SOLAR_PRODUCING_KW = 0.1
 # Mode switch cooldown (seconds) - prevents flapping
 MODE_SWITCH_COOLDOWN_S = 300
 
-# EB deferral — minimum buffer hours beyond charge time before triggering EB.
-# EB is aggressive (~8kW grid charging). It charges fast — a 7.8 kWh gap
-# takes ~1 hour. There's no reason to start at 5am for a 5pm peak.
-# The engine recalculates every cycle (30 min), so deferring is safe:
-# TOU drift and solar may shrink the gap naturally, and EB can always
-# catch up later. This constant sets the minimum comfortable buffer.
-# Example: charge_time=1h, min_buffer=max(2.0, 1.0)=2.0h → don't start
-# EB until hours_to_peak <= 3.0h (i.e., ~2pm for 5pm peak).
-EB_DEFERRAL_MIN_BUFFER_HOURS = 2.0
 
 # Overnight drain — REPLACED by continuous target tracking in v4.1.
 # These constants are retained only as fallbacks if the DB load profile
@@ -2074,22 +2065,32 @@ class AdaptiveEngine:
             return cached
         value = float(self.config.get('backup_reserve_pct', 20.0))
         source = 'config'
-        try:
-            conn = self._db_conn()
-            cutoff = (state.timestamp - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-            row = conn.execute(
-                "SELECT self_reserve_pct FROM system_readings "
-                "WHERE timestamp >= ? AND mode != 'emergency_backup' "
-                "AND self_reserve_pct > 0 AND self_reserve_pct < 90 "
-                "ORDER BY timestamp DESC LIMIT 1",
-                (cutoff,)
-            ).fetchone()
-            conn.close()
+        # Prefer active_reserve_pct from SC readings (the mode-conditional
+        # column that replaces the self/tou pair); fall back to the legacy
+        # self_reserve_pct while it still exists. Each query is isolated so a
+        # dropped column degrades to the next source instead of disabling this.
+        queries = [
+            ("SELECT active_reserve_pct FROM system_readings "
+             "WHERE timestamp >= ? AND mode = 'self_consumption' "
+             "AND active_reserve_pct > 0 AND active_reserve_pct < 90 "
+             "ORDER BY timestamp DESC LIMIT 1", timedelta(days=7)),
+            ("SELECT self_reserve_pct FROM system_readings "
+             "WHERE timestamp >= ? AND mode != 'emergency_backup' "
+             "AND self_reserve_pct > 0 AND self_reserve_pct < 90 "
+             "ORDER BY timestamp DESC LIMIT 1", timedelta(hours=24)),
+        ]
+        for sql, window in queries:
+            try:
+                conn = self._db_conn()
+                cutoff = (state.timestamp - window).strftime('%Y-%m-%d %H:%M:%S')
+                row = conn.execute(sql, (cutoff,)).fetchone()
+                conn.close()
+            except Exception:
+                continue
             if row and row[0] is not None:
                 value = float(row[0])
                 source = 'agate'
-        except Exception:
-            pass
+                break
         self._reserve_cache = value
         self._reserve_source = source
         return value

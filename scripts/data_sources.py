@@ -50,6 +50,56 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Mode-switch reserve preservation (v4.6.2)
+# =============================================================================
+
+# Per-mode reserve fields returned by the cloud switch-status call
+# (Client._switch_status), keyed by our canonical mode names.
+_MODE_RESERVE_FIELD = {
+    'emergency_backup': 'backupMaxSoc',
+    'self_consumption': 'selfMinSoc',
+    'time_of_use': 'touMinSoc',
+}
+
+
+def preserved_mode_soc(mode: str, sw_status: Optional[dict]) -> tuple:
+    """Reserve SOC to send with a mode switch, and where it came from.
+
+    The cloud mode-switch call always carries a reserve (soc) that the aGate
+    adopts for that mode. Before v4.6.2 we always sent RESERVE_SOC_HOME /
+    RESERVE_SOC_BACKUP (defaults 20 / 100), so every engine switch silently
+    reset a reserve the user had set in the Franklin app.
+
+    Precedence:
+      1. RESERVE_SOC_HOME / RESERVE_SOC_BACKUP explicitly set in the environment
+         — the user asked the engine to enforce it
+      2. The aGate's current reserve for the target mode (echoed back unchanged)
+      3. The config default, only if the device value can't be read
+
+    Returns (soc: int, source: 'env' | 'agate' | 'default').
+    """
+    import os
+    is_backup = mode == 'emergency_backup'
+    env_key = 'RESERVE_SOC_BACKUP' if is_backup else 'RESERVE_SOC_HOME'
+    default = config.RESERVE_SOC_BACKUP if is_backup else config.RESERVE_SOC_HOME
+
+    if os.environ.get(env_key, '').strip():
+        return int(default), 'env'
+
+    field_name = _MODE_RESERVE_FIELD.get(mode)
+    if sw_status and field_name:
+        try:
+            value = int(float(sw_status.get(field_name)))
+            if 0 <= value <= 100:
+                return value, 'agate'
+        except (TypeError, ValueError):
+            pass
+
+    logger.warning(f'Could not read aGate {mode} reserve — using config default {default}%')
+    return int(default), 'default'
+
+
+# =============================================================================
 # Data Structures
 # =============================================================================
 
@@ -850,8 +900,9 @@ class CloudDataSource(DataSource):
             fetcher = TokenFetcher(config.FRANKLIN_USERNAME, config.FRANKLIN_PASSWORD)
             client = Client(fetcher, config.FRANKLIN_GATEWAY_ID)
 
-            # Read current Storm Hedge state from the cloud so we can preserve
-            # the user's app setting across our mode switch.
+            # Read current Storm Hedge state and per-mode reserves from the
+            # cloud so the switch preserves the user's app settings.
+            sw_status = None
             try:
                 sw_status = await client._switch_status()
                 current_stromen = str(sw_status.get("stromEn", 0))
@@ -860,24 +911,27 @@ class CloudDataSource(DataSource):
                 current_stromen = "0"
 
             if mode in ['emergency_backup', 'backup']:
-                mode_obj = Mode.emergency_backup(soc=config.RESERVE_SOC_BACKUP)
-            elif mode == 'self_consumption':
-                # v4 engine explicitly requests self_consumption for peak hours
-                mode_obj = Mode.self_consumption(soc=config.RESERVE_SOC_HOME)
-            elif mode == 'time_of_use':
-                # v4 three-mode strategy: TOU is the default resting state
-                # Requires Franklin app TOU tariff configured with "aPower charges from solar"
-                mode_obj = Mode.time_of_use(soc=config.RESERVE_SOC_HOME)
+                target = 'emergency_backup'
+            elif mode in ('self_consumption', 'time_of_use'):
+                # v4: SC for peak hours; TOU is the resting state (requires the
+                # Franklin app TOU tariff configured with "aPower charges from solar")
+                target = mode
             else:
                 # v3.5 legacy "home" target — use config.HOME_MODE to decide
-                if config.HOME_MODE == 'self_consumption':
-                    mode_obj = Mode.self_consumption(soc=config.RESERVE_SOC_HOME)
-                else:
-                    mode_obj = Mode.time_of_use(soc=config.RESERVE_SOC_HOME)
+                target = 'self_consumption' if config.HOME_MODE == 'self_consumption' else 'time_of_use'
+
+            soc, soc_source = preserved_mode_soc(target, sw_status)
+            factory = {
+                'emergency_backup': Mode.emergency_backup,
+                'self_consumption': Mode.self_consumption,
+                'time_of_use': Mode.time_of_use,
+            }[target]
+            mode_obj = factory(soc=soc)
 
             mode_obj._stromen_preserve = current_stromen
             await client.set_mode(mode_obj)
-            logger.info(f'Mode switch successful: {mode} (stromEn preserved as {current_stromen})')
+            logger.info(f'Mode switch successful: {mode} (reserve {soc}% from {soc_source}, '
+                        f'stromEn preserved as {current_stromen})')
             return True
 
         except Exception as e:
