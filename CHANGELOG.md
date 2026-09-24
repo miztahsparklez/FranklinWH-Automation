@@ -4,6 +4,42 @@ All notable changes to FranklinWH Battery Automation.
 
 ---
 
+## v4.6.2 — September 2026
+
+An engine behavior release from the NEM 3.0 charging discussion in #21, plus a telemetry fix. All engine changes are in `adaptive_engine.py`; no new settings.
+
+### Emergency Backup commitment (#21)
+- **Root cause:** EB was re-evaluated every 30-minute cycle through the same deferral checks that decided whether to start it. Once EB had partly closed the gap, the remaining gap often looked "solar-fillable," so EB dropped back to TOU after a single cycle and rarely reached its ceiling. This looked like a fixed 30-minute EB limit.
+- **Fix:** once EB is running it continues until SOC reaches the grid-leg ceiling (`TAPER_CEILING_PCT`) or peak begins. On completion the engine returns **TOU** (holding the charge for peak) instead of self-consumption. EB's commitment also takes precedence over the pre-peak partial-peak check and continuous-target logic, which could previously abandon a charge mid-way.
+
+### `SAFETY_MARGIN_HOURS` now works (#21)
+- The v4 engine hardcoded a 0.5 h margin in both gap paths and never read the setting. It is now passed through from config. It acts as extra lead time: a larger value starts EB earlier before peak. Default standardized to 0.5 across `config.py`, the v4.6 config migration, docs and `.env.example` (config.py had drifted to 0.75), so behavior is unchanged unless you set it.
+
+### Taper ceiling applies to export systems (#21)
+- `TAPER_CEILING_PCT` previously bounded grid charging only when `SOLAR_EXPORT=false`. Export systems grid-charged to the full target, then exported the solar that grid energy displaced — a loss at NEM 3 export values. The ceiling now bounds the grid leg for every install; solar still fills above it.
+
+### Pre-peak discharge no longer spends EB-charged energy
+- The partial-peak pre-peak check (P4) could discharge minutes after EB finished, because its sufficiency test counted energy EB had just bought. On three-tier plans (e.g. PG&E EV2-A) this meant buying at the partial-peak rate and discharging at the same rate. Energy added in EB today is now earmarked for peak and excluded from the pre-peak surplus.
+
+### Continuous-target fixes (#21)
+- "SC committed, SOC rising — hold SC" compared SOC against the lowest reading in the last 90 minutes, so an EB-driven climb counted as SC holding its own and the engine stayed in SC while draining. The check now uses only the trailing run of self-consumption readings (at least 15 minutes).
+- At target near peak, the engine rode self-consumption into peak even when solar was below load, spending stored energy at a pre-peak rate. It now does so only when solar covers the load; otherwise TOU holds the charge until peak.
+
+### Reserve follows the aGate (#21)
+- Engine math used `BACKUP_RESERVE_PCT` from config everywhere, so it would stop discharging at 20% even if the aGate's self-consumption reserve was set lower. The engine now uses the aGate's live SC reserve (already recorded on every reading) and falls back to config only when it is unavailable.
+
+### Telemetry install UUID persistence
+- **Root cause:** the install UUID was persisted only through the dashboard consent modal. Installs that enabled telemetry with `TELEMETRY_ENABLED=true` in `.env` never wrote it, so every daily report arrived with a new UUID (one site accumulated 100+). A new UUID is now written to `data/install_uuid` on first use; an existing dashboard-consent UUID still takes precedence.
+
+### Other
+- Log lines that appended the uncapped plan target after a capped ceiling ("charge to 75% ... Grid charge ... to 89%", or "charge to 99% (not 99%)") now state one consistent target.
+- Docker healthcheck replaced: `pgrep` is not present in `python:3.11-slim`, so the container always reported unhealthy. It now probes the scheduler API (`/api/version`).
+
+### Credits
+Issues reported and analyzed in detail by **miztahsparklez** on #21.
+
+---
+
 ## v4.6.1 — June 2026
 
 A bug-fix and collector-maintenance release. Two independent efforts: a mode-detection fix that restores correct behavior for users whose Franklin schedule has a custom name, and a rewrite of the SolarEdge panel collector against SolarEdge's new authenticated energy API.
