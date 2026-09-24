@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.getenv('DATA_DIR', '/app/data'))
 LOG_DIR = Path(os.getenv('LOG_DIR', '/app/logs'))
 CONSENT_FILE = DATA_DIR / 'telemetry_consent.json'
+UUID_FILE = DATA_DIR / 'install_uuid'
 
 # ── Telemetry Endpoint ─────────────────────────────────────────────
 # HTTP endpoint hosted at mtnears.com — receives telemetry POSTs.
@@ -171,10 +172,14 @@ def is_telemetry_enabled() -> bool:
 
 
 def _get_or_create_uuid() -> str:
-    """Get existing install UUID or generate a new one.
+    """Get existing install UUID or generate (and persist) a new one.
 
     UUID is random — no tie to gateway ID, MAC, or any system identifier.
-    Persists in the consent file on the Docker volume.
+    Lookup order: consent file (dashboard opt-in), then install_uuid file.
+    A new UUID is written to the install_uuid file immediately. Before
+    v4.6.2 it was only persisted via the dashboard consent modal, so
+    installs enabled with TELEMETRY_ENABLED=true in .env reported a fresh
+    UUID every day.
     """
     if CONSENT_FILE.exists():
         try:
@@ -184,7 +189,20 @@ def _get_or_create_uuid() -> str:
                 return data['install_uuid']
         except (json.JSONDecodeError, OSError):
             pass
-    return str(uuid.uuid4())
+    try:
+        if UUID_FILE.exists():
+            existing = UUID_FILE.read_text().strip()
+            if existing:
+                return existing
+    except OSError:
+        pass
+    new_uuid = str(uuid.uuid4())
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        UUID_FILE.write_text(new_uuid + '\n')
+    except OSError as e:
+        logger.warning(f"Could not persist install UUID to {UUID_FILE}: {e}")
+    return new_uuid
 
 
 # ═══════════════════════════════════════════════════════════════════
