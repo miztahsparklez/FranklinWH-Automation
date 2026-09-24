@@ -736,6 +736,12 @@ class AdaptiveEngine:
         #   - Post-peak partial → SC (use remaining battery; tomorrow's peak
         #     is recoverable via overnight + solar)
         if state.is_partial_peak:
+            # EB in progress for the upcoming peak takes precedence over the
+            # pre-peak discharge check (see EB commitment in P7).
+            if state.current_mode == 'emergency_backup':
+                eb_decision = self._evaluate_eb_gap(state)
+                if eb_decision and eb_decision.mode == 'emergency_backup':
+                    return eb_decision
             pp_decision = self._evaluate_partial_peak(state)
             if pp_decision:
                 if pp_decision.action == "switch_to_tou":
@@ -784,6 +790,12 @@ class AdaptiveEngine:
         # charging when time-to-peak is tight. Without this, CT's TOU blocks
         # EB from ever evaluating on low-solar days.
         if not self.solar_export:
+            # EB in progress: its commitment outranks CT, which would otherwise
+            # re-decide SC/hold mid-charge and abandon the grid leg.
+            if state.current_mode == 'emergency_backup':
+                eb_decision = self._evaluate_eb_gap(state)
+                if eb_decision and eb_decision.mode == 'emergency_backup':
+                    return eb_decision
             ct_decision = self._evaluate_continuous_target(state)
             if ct_decision:
                 if ct_decision.action == "switch_to_tou":
@@ -797,7 +809,7 @@ class AdaptiveEngine:
             return eb_decision
 
         # --- Default: TOU ---
-        backup_reserve = self.config.get('backup_reserve_pct', 20.0)
+        backup_reserve = self._backup_reserve_pct(state)
         if state.soc_percent <= backup_reserve + 2.0:
             return self._decide(
                 state, "time_of_use",
@@ -1161,7 +1173,7 @@ class AdaptiveEngine:
             getattr(getattr(self.profile, 'capacity', None),
                     'total_capacity_kwh', 27.2)
         )
-        backup_reserve = self.config.get('backup_reserve_pct', 20.0)
+        backup_reserve = self._backup_reserve_pct(state)
 
         # --- Get forecast solar ---
         remaining_solar_kwh, wx_score, forecast_source = self._get_remaining_solar_kwh(state)
@@ -1432,23 +1444,8 @@ class AdaptiveEngine:
             if (state.current_mode == 'self_consumption'
                     and solar_producing
                     and now_hour < sunset_hour - 0.5):
-                # Check if SOC has been rising — compare to reading from ~1 hour ago
-                soc_was_rising = False
-                try:
-                    import sqlite3
-                    db_path = os.path.join(os.getenv('DATA_DIR', '/app/data'), 'franklin.db')
-                    conn = sqlite3.connect(db_path, timeout=5)
-                    cutoff = (state.timestamp - timedelta(minutes=90)).strftime('%Y-%m-%d %H:%M:%S')
-                    row = conn.execute(
-                        "SELECT MIN(soc_pct) FROM system_readings "
-                        "WHERE timestamp >= ? AND soc_pct IS NOT NULL",
-                        (cutoff,)
-                    ).fetchone()
-                    conn.close()
-                    if row and row[0] is not None:
-                        soc_was_rising = (soc > row[0])
-                except Exception:
-                    pass
+                # Check if SOC has been rising while in SC (EB-driven rises excluded)
+                soc_was_rising = self._sc_soc_rising(state, soc)
 
                 if soc_was_rising and soc > floor_pct:
                     return self._decide(
@@ -1472,15 +1469,29 @@ class AdaptiveEngine:
         # SOC AT TARGET — hold (dead band)
         # =====================================================================
         if at_target:
-            # If near peak and SOC covers peak need, ride SC into peak
+            # If near peak and SOC covers peak need, ride SC into peak — but
+            # only when solar covers the load. With solar < load, pre-peak SC
+            # spends stored (possibly grid-bought) energy at a pre-peak rate
+            # that was meant for the peak window. TOU holds it until peak,
+            # when P4 takes over.
             if (hours_to_peak is not None and hours_to_peak <= 3.0
                     and soc >= backup_reserve + peak_need_pct):
+                if state.solar_kw >= state.home_load_kw:
+                    return self._decide(
+                        state, "self_consumption",
+                        f"CT: SOC {soc:.0f}% ≈ target {target_soc:.0f}%, "
+                        f"{hours_to_peak:.1f}h to peak, solar {state.solar_kw:.1f}kW ≥ "
+                        f"load {state.home_load_kw:.1f}kW — riding SC into peak",
+                        confidence=0.85, priority=7,
+                        action="switch_to_self_consumption", metrics=metrics,
+                    )
                 return self._decide(
-                    state, "self_consumption",
+                    state, "time_of_use",
                     f"CT: SOC {soc:.0f}% ≈ target {target_soc:.0f}%, "
-                    f"{hours_to_peak:.1f}h to peak — riding SC into peak",
+                    f"{hours_to_peak:.1f}h to peak, solar {state.solar_kw:.1f}kW < "
+                    f"load {state.home_load_kw:.1f}kW — TOU holds charge for peak",
                     confidence=0.85, priority=7,
-                    action="switch_to_self_consumption", metrics=metrics,
+                    action="switch_to_tou", metrics=metrics,
                 )
 
             # Otherwise hold current mode
@@ -1522,7 +1533,7 @@ class AdaptiveEngine:
             getattr(getattr(self.profile, 'capacity', None),
                     'total_capacity_kwh', 27.2)
         )
-        reserve_pct = self.config.get('backup_reserve_pct', 20.0)
+        reserve_pct = self._backup_reserve_pct(state)
         available_kwh = max(
             0.0,
             (state.soc_percent - reserve_pct) / 100.0 * battery_kwh
@@ -1568,23 +1579,30 @@ class AdaptiveEngine:
         # discharge through this partial-peak window while still covering peak.
         peak_demand_kwh = self._forecast_peak_demand(state)
         threshold = peak_demand_kwh + P45_SAFETY_MARGIN_KWH
+        # Energy EB bought today is earmarked for peak — it can't count toward
+        # a pre-peak discharge surplus (buying at partial-peak then spending at
+        # partial-peak is a pure round-trip loss).
+        eb_kwh = self._eb_charged_kwh_today(state, battery_kwh)
+        spendable_kwh = max(0.0, available_kwh - eb_kwh)
         metrics['p45_peak_demand_kwh'] = round(peak_demand_kwh, 1)
         metrics['p45_safety_margin_kwh'] = round(P45_SAFETY_MARGIN_KWH, 1)
         metrics['p45_threshold_kwh'] = round(threshold, 1)
+        metrics['p45_eb_earmarked_kwh'] = round(eb_kwh, 1)
 
-        if available_kwh >= threshold:
+        if spendable_kwh >= threshold:
             return self._decide(
                 state, "self_consumption",
-                f"Partial-peak (pre-peak): {available_kwh:.1f}kWh available ≥ "
+                f"Partial-peak (pre-peak): {spendable_kwh:.1f}kWh available ≥ "
                 f"{peak_demand_kwh:.1f}kWh peak need + {P45_SAFETY_MARGIN_KWH:.1f}kWh margin — "
                 f"discharging through",
                 confidence=0.85, priority=4,
                 action="switch_to_self_consumption", metrics=metrics,
             )
 
+        eb_note = f" ({eb_kwh:.1f}kWh EB-charged, held for peak)" if eb_kwh >= 0.5 else ""
         return self._decide(
             state, "time_of_use",
-            f"Partial-peak (pre-peak): {available_kwh:.1f}kWh available < "
+            f"Partial-peak (pre-peak): {spendable_kwh:.1f}kWh available{eb_note} < "
             f"{peak_demand_kwh:.1f}kWh peak need + {P45_SAFETY_MARGIN_KWH:.1f}kWh margin — "
             f"TOU to preserve battery for peak",
             confidence=0.85, priority=4,
@@ -1696,7 +1714,12 @@ class AdaptiveEngine:
         ceiling_pct = plan.morning_ceiling_pct
 
         taper_cap = TAPER_CEILING_PCT
-        if not self.solar_export and ceiling_pct > taper_cap:
+        # The taper ceiling bounds the GRID leg for every install. Export
+        # systems used to grid-charge to the full plan ceiling, then export
+        # the solar that grid energy displaced — a loss under NEM 3 export
+        # values. Solar still fills above the ceiling either way.
+        ceiling_capped = ceiling_pct > taper_cap
+        if ceiling_capped:
             logger.debug(
                 f"Taper ceiling cap: {ceiling_pct:.0f}% → {taper_cap:.0f}%"
             )
@@ -1723,10 +1746,40 @@ class AdaptiveEngine:
             'hours_to_peak': round(hours_to_peak, 1),
         }
 
+        # Log suffix: plan.recommendation states the UNCAPPED ceiling, which
+        # contradicts the capped target in the same line — replace it when capped.
+        if ceiling_capped:
+            rec = (f"Plan ceiling {plan.morning_ceiling_pct:.0f}% capped to taper "
+                   f"{ceiling_pct:.0f}%; solar fills above.")
+        else:
+            rec = plan.recommendation
+
+        # --- EB commitment ---
+        # Once EB is running it stays until the grid-leg ceiling is reached
+        # (or peak starts, which ends EB evaluation upstream). Re-running the
+        # deferral checks mid-charge used to drop EB after one 30-min cycle
+        # whenever the partly-closed gap looked solar-fillable, so EB almost
+        # never reached its ceiling. On completion return TOU, not SC: the
+        # charge is held for peak, where P4 takes over.
+        if state.current_mode == 'emergency_backup':
+            if state.soc_percent < ceiling_pct:
+                return self._decide(
+                    state, "emergency_backup",
+                    f"EB committed: SOC {state.soc_percent:.0f}% < ceiling {ceiling_pct:.0f}%, "
+                    f"{hours_to_peak:.1f}h to peak — continuing grid charge",
+                    confidence=0.9, priority=7, action="hold", metrics=metrics,
+                )
+            return self._decide(
+                state, "time_of_use",
+                f"EB complete: SOC {state.soc_percent:.0f}% ≥ ceiling {ceiling_pct:.0f}% — "
+                f"TOU holds charge until peak",
+                confidence=0.9, priority=7, action="switch_to_tou", metrics=metrics,
+            )
+
         if gap_kwh <= 0:
             return self._decide(
                 state, "time_of_use",
-                f"Solar surplus: {plan.recommendation}",
+                f"Solar surplus: {rec}",
                 confidence=0.85 if plan.forecast_source.startswith('forecast_solar') else 0.7,
                 priority=7, action="switch_to_tou", metrics=metrics,
             )
@@ -1734,7 +1787,7 @@ class AdaptiveEngine:
         if gap_kwh < 1.0:
             return self._decide(
                 state, "time_of_use",
-                f"Tiny gap ({gap_kwh:.1f} kWh) — solar/natural will cover. {plan.recommendation}",
+                f"Tiny gap ({gap_kwh:.1f} kWh) — solar/natural will cover. {rec}",
                 confidence=0.8, priority=7, action="switch_to_tou", metrics=metrics,
             )
 
@@ -1750,7 +1803,7 @@ class AdaptiveEngine:
             return self._decide(
                 state, "time_of_use",
                 f"SOC {state.soc_percent:.0f}% ≥ forecast ceiling {ceiling_pct:.0f}% — "
-                f"solar fills the rest. {plan.recommendation}",
+                f"solar fills the rest. {rec}",
                 confidence=0.85, priority=7, action="switch_to_tou",
                 metrics=metrics,
             )
@@ -1784,7 +1837,7 @@ class AdaptiveEngine:
                             metrics=metrics,
                         )
 
-            safety_margin_hours = 0.5
+            safety_margin_hours = float(self.config.get('safety_margin_hours', 0.5))
             buffer_hours = hours_to_peak - charge_time_hours
 
             metrics['charge_time_hours'] = round(charge_time_hours, 2)
@@ -1825,9 +1878,9 @@ class AdaptiveEngine:
             if charge_time_hours <= hours_to_peak:
                 return self._decide(
                     state, "emergency_backup",
-                    f"Forecast gap: {gap_kwh:.1f} kWh → charge to {ceiling_pct:.0f}% "
-                    f"(not {self.target_soc:.0f}%), solar fills the rest. "
-                    f"Buffer tight ({buffer_hours:.1f}h). {plan.recommendation}",
+                    f"Forecast gap: {gap_kwh:.1f} kWh → grid charge to {ceiling_pct:.0f}% "
+                    f"(target {self.target_soc:.0f}%), solar fills the rest. "
+                    f"Buffer tight ({buffer_hours:.1f}h). {rec}",
                     confidence=0.85, priority=7, action="switch_to_backup",
                     metrics=metrics,
                 )
@@ -1858,7 +1911,7 @@ class AdaptiveEngine:
         current_kwh = cap.kwh_at_soc(state.soc_percent)
         target_soc = self.target_soc
 
-        if not self.solar_export and target_soc > TAPER_CEILING_PCT:
+        if target_soc > TAPER_CEILING_PCT:
             target_soc = TAPER_CEILING_PCT
 
         target_kwh = cap.kwh_at_soc(target_soc)
@@ -1891,6 +1944,22 @@ class AdaptiveEngine:
             'charge_time_hours': round(charge_time_hours, 2),
             'hours_to_peak': round(state.hours_to_peak, 1),
         }
+
+        # EB commitment (see _evaluate_gap_with_plan)
+        if state.current_mode == 'emergency_backup':
+            if state.soc_percent < target_soc:
+                return self._decide(
+                    state, "emergency_backup",
+                    f"EB committed: SOC {state.soc_percent:.0f}% < ceiling {target_soc:.0f}% — "
+                    f"continuing grid charge",
+                    confidence=0.9, priority=7, action="hold", metrics=metrics,
+                )
+            return self._decide(
+                state, "time_of_use",
+                f"EB complete: SOC {state.soc_percent:.0f}% ≥ ceiling {target_soc:.0f}% — "
+                f"TOU holds charge until peak",
+                confidence=0.9, priority=7, action="switch_to_tou", metrics=metrics,
+            )
 
         if gap_kwh <= 0:
             return self._decide(
@@ -1937,7 +2006,7 @@ class AdaptiveEngine:
                         action="switch_to_self_consumption", metrics=metrics,
                     )
 
-            safety_margin_hours = 0.5
+            safety_margin_hours = float(self.config.get('safety_margin_hours', 0.5))
             buffer_hours = state.hours_to_peak - charge_time_hours
             metrics['buffer_hours'] = round(buffer_hours, 1)
 
@@ -1982,6 +2051,109 @@ class AdaptiveEngine:
                 confidence=0.7, priority=7,
                 action="switch_to_self_consumption", metrics=metrics,
             )
+
+    # ===================================================================
+    # Shared state helpers (v4.6.2)
+    # ===================================================================
+
+    def _db_conn(self):
+        import sqlite3
+        db_path = os.path.join(os.getenv('DATA_DIR', '/app/data'), 'franklin.db')
+        return sqlite3.connect(db_path, timeout=5)
+
+    def _backup_reserve_pct(self, state: SystemState) -> float:
+        """Discharge floor used in engine math.
+
+        Prefers the aGate's live self-consumption reserve (recorded on every
+        reading) so the engine never stops discharging above a reserve the
+        user deliberately set lower on the aGate. EB readings report 100%,
+        so they are excluded. Falls back to BACKUP_RESERVE_PCT from config.
+        """
+        cached = getattr(self, '_reserve_cache', None)
+        if cached is not None:
+            return cached
+        value = float(self.config.get('backup_reserve_pct', 20.0))
+        source = 'config'
+        try:
+            conn = self._db_conn()
+            cutoff = (state.timestamp - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+            row = conn.execute(
+                "SELECT self_reserve_pct FROM system_readings "
+                "WHERE timestamp >= ? AND mode != 'emergency_backup' "
+                "AND self_reserve_pct > 0 AND self_reserve_pct < 90 "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (cutoff,)
+            ).fetchone()
+            conn.close()
+            if row and row[0] is not None:
+                value = float(row[0])
+                source = 'agate'
+        except Exception:
+            pass
+        self._reserve_cache = value
+        self._reserve_source = source
+        return value
+
+    def _eb_charged_kwh_today(self, state: SystemState, battery_kwh: float) -> float:
+        """kWh added to the battery while in Emergency Backup so far today.
+
+        EB exists only to carry the battery through peak, so energy it bought
+        is earmarked for the peak window and must not be spent beforehand.
+        Measured from SOC rise across consecutive readings where the earlier
+        reading was in EB.
+        """
+        try:
+            conn = self._db_conn()
+            day_start = state.timestamp.strftime('%Y-%m-%d 00:00:00')
+            rows = conn.execute(
+                "SELECT mode, soc_pct FROM system_readings "
+                "WHERE timestamp >= ? AND timestamp <= ? AND soc_pct IS NOT NULL "
+                "ORDER BY timestamp",
+                (day_start, state.timestamp.strftime('%Y-%m-%d %H:%M:%S'))
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return 0.0
+        gained_pct = 0.0
+        for (prev_mode, prev_soc), (_, cur_soc) in zip(rows, rows[1:]):
+            if prev_mode == 'emergency_backup' and cur_soc > prev_soc:
+                gained_pct += cur_soc - prev_soc
+        return gained_pct / 100.0 * battery_kwh
+
+    def _sc_soc_rising(self, state: SystemState, soc: float) -> bool:
+        """True if SOC has risen while continuously in self-consumption.
+
+        Only the trailing contiguous run of SC readings (up to 90 min) counts,
+        and it must span at least 15 minutes. A climb that happened in EB
+        before the switch to SC is not evidence that SC is holding its own.
+        """
+        try:
+            conn = self._db_conn()
+            cutoff = (state.timestamp - timedelta(minutes=90)).strftime('%Y-%m-%d %H:%M:%S')
+            rows = conn.execute(
+                "SELECT timestamp, mode, soc_pct FROM system_readings "
+                "WHERE timestamp >= ? AND timestamp <= ? AND soc_pct IS NOT NULL "
+                "ORDER BY timestamp",
+                (cutoff, state.timestamp.strftime('%Y-%m-%d %H:%M:%S'))
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return False
+        block = []
+        for ts, mode, s in reversed(rows):
+            if mode != 'self_consumption':
+                break
+            block.append((ts, s))
+        if len(block) < 2:
+            return False
+        try:
+            newest = datetime.strptime(block[0][0][:19], '%Y-%m-%d %H:%M:%S')
+            oldest = datetime.strptime(block[-1][0][:19], '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return False
+        if (newest - oldest).total_seconds() < 15 * 60:
+            return False
+        return soc > min(s for _, s in block)
 
     def _track_curtailment(self, state: SystemState) -> float:
         """Track solar curtailment when battery is full and solar is producing.

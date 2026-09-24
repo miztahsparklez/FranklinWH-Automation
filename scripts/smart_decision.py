@@ -126,6 +126,7 @@ if getattr(config, 'ADAPTIVE_ENGINE_ENABLED', False):
                 'battery_capacity_kwh': getattr(config, 'BATTERY_CAPACITY_KWH', 30.0),
                 'peak_start_hour': _engine_peak_start,
                 'solar_export': getattr(config, 'SOLAR_EXPORT', False),
+                'safety_margin_hours': getattr(config, 'SAFETY_MARGIN_HOURS', 0.5),
             },
         )
         ADAPTIVE_ENGINE_LOADED = True

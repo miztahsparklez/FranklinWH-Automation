@@ -218,9 +218,9 @@ MAPPINGS = [
     # --- engine tuning ---
     ('TARGET_SOC', 'engine.target_soc', 'float', 'engine', 95.0, 0,
      'Configured SOC target (solar-fed ceiling); grid charging stops at the '
-     'taper ceiling on non-export systems'),
-    ('SAFETY_MARGIN_HOURS', 'engine.safety_margin_hours', 'float', 'engine', 0.75, 0,
-     'Hours of safety margin in charge-timing math'),
+     'taper ceiling'),
+    ('SAFETY_MARGIN_HOURS', 'engine.safety_margin_hours', 'float', 'engine', 0.5, 0,
+     'Extra lead time (hours) for Emergency Backup grid charging before peak; higher starts EB earlier'),
     ('CHARGING_STRATEGY', 'engine.charging_strategy', 'str', 'engine', 'balanced', 0,
      'Charging strategy profile'),
     ('TAPER_CEILING_PCT', 'engine.taper_ceiling_pct', 'float', 'engine', 85.0, 0,

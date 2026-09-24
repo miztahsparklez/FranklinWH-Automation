@@ -305,13 +305,13 @@ For simple two-tier rate plans with one peak window, peak hours can be configure
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TARGET_SOC` | `95.0` | Target battery % before peak |
-| `SAFETY_MARGIN_HOURS` | `0.5` | Buffer time for charge calculations |
+| `SAFETY_MARGIN_HOURS` | `0.5` | Extra lead time before peak for Emergency Backup grid charging. EB starts when the time left before peak minus the estimated charge time drops to this margin; higher = starts earlier. Once started, EB runs until `TAPER_CEILING_PCT` or peak |
 | `CHARGING_STRATEGY` | `balanced` | `conservative`, `balanced`, or `aggressive` |
 | `MIN_SOLAR_FOR_WAIT` | `0.5` | Minimum solar kW to delay grid charging |
-| `TAPER_CEILING_PCT` | `95` | Grid charging ceiling for non-export systems (see below) |
+| `TAPER_CEILING_PCT` | `85` | Grid charging ceiling for all systems; solar fills above it (see below) |
 | `CT_SC_COMMIT_MARGIN_PCT` | `3.0` | How close projection must come to target before Self-Consumption commits in Continuous Target Tracking. Lower values force the engine to grid-charge harder on small-solar / cloudy days; higher values commit to SC earlier. Added in v4.3.1 to fix under-target peak entry on small-solar systems |
 
-**Taper ceiling tuning (`TAPER_CEILING_PCT`):** On non-export systems, battery charge rate tapers at high SOC, which means solar production that exceeds the reduced charge rate gets curtailed (wasted). By capping grid charging below the taper knee, the engine leaves room for solar to fill during peak production hours. Start at 95 and check your curtailment data after each sunny day. Lower by 5 until curtailment drops to near zero. Typical sweet spot is 75-90 depending on your battery size and solar output. Export systems can leave this at 95 since surplus goes to the grid for credit.
+**Taper ceiling tuning (`TAPER_CEILING_PCT`):** On non-export systems, battery charge rate tapers at high SOC, which means solar production that exceeds the reduced charge rate gets curtailed (wasted). By capping grid charging below the taper knee, the engine leaves room for solar to fill during peak production hours. Start at 95 and check your curtailment data after each sunny day. Lower by 5 until curtailment drops to near zero. Typical sweet spot is 75-90 depending on your battery size and solar output. As of v4.6.2 the ceiling also applies to export systems: grid-charging to full just displaces solar that then exports at a low NEM 3 value, so export users should tune it the same way.
 
 ---
 

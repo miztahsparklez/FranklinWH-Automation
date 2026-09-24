@@ -250,7 +250,7 @@ class Config:
     
     # ===== Decision Tuning =====
     TARGET_SOC: float = field(default_factory=lambda: get_float('TARGET_SOC', 95.0))
-    SAFETY_MARGIN_HOURS: float = field(default_factory=lambda: get_float('SAFETY_MARGIN_HOURS', 0.75))
+    SAFETY_MARGIN_HOURS: float = field(default_factory=lambda: get_float('SAFETY_MARGIN_HOURS', 0.5))
     CHARGING_STRATEGY: str = field(default_factory=lambda: os.getenv('CHARGING_STRATEGY', 'balanced'))
     
     # Reserve SOC for mode switching (passed to franklinwh library)
