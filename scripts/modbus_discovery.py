@@ -14,7 +14,7 @@ Register Map (confirmed on Ken's 2-battery system, Feb 2026):
   Franklin Extended (proprietary):
     15502: PV total power (watts)
     15506: Home load (watts)
-    15507: On-grid mode (0=Backup, 1=TOU, 2=Self-Consumption, 3=Manual)
+    15507: On-grid mode (1=Backup, 2=Self-Consumption, 3=TOU, 4=Manual)
     15508: Self-consumption reserve (%)
     15509: TOU reserve (%)
 
@@ -54,7 +54,7 @@ M713_SOH = 1038              # offset 3: SoH, ÷10 = percent
 EXT_BASE = 15500
 EXT_PV_TOTAL = 15502         # Total PV/solar power in watts
 EXT_HOME_LOAD = 15506        # Home load in watts
-EXT_ONGRID_MODE = 15507      # 0=Backup, 1=TOU, 2=Self-Consumption, 3=Manual
+EXT_ONGRID_MODE = 15507      # 1=Backup, 2=Self-Consumption, 3=TOU, 4=Manual (1-indexed, hardware-verified)
 EXT_SELF_RESERVE = 15508     # Self-consumption reserve percent
 EXT_TOU_RESERVE = 15509      # TOU reserve percent
 
@@ -66,10 +66,10 @@ MODBUS_DEFAULT_UNIT = 2       # aGate uses unit ID 2
 
 # Mode mapping
 MODE_MAP = {
-    0: 'emergency_backup',
-    1: 'time_of_use',
+    1: 'emergency_backup',
     2: 'self_consumption',
-    3: 'manual',
+    3: 'time_of_use',
+    4: 'manual',
 }
 MODE_MAP_REVERSE = {v: k for k, v in MODE_MAP.items()}
 
