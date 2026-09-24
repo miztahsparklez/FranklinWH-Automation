@@ -20,7 +20,7 @@ A round of engine fixes from the NEM 3.0 discussion in [#21](https://github.com/
 - **`SAFETY_MARGIN_HOURS` now works** as extra lead time before peak (it was previously ignored by the v4 engine)
 - **Taper ceiling applies to export systems too** — grid charging stops at the ceiling and solar fills the rest
 - **No pre-peak drain of grid-bought energy** — energy EB charged is held for peak, and the engine only rides self-consumption into peak when solar is covering the load
-- **Reserve follows your aGate** — the engine's discharge floor uses the aGate's live self-consumption reserve instead of `BACKUP_RESERVE_PCT` when available
+- **Your aGate reserve is left alone** — mode switches used to reset the reserve you set in the Franklin app to 20%; they now keep it, and the engine's discharge floor follows it too
 - **Telemetry fix** — installs that enabled telemetry through `.env` no longer report a new install ID every day
 - **Healthy container status** — the Docker healthcheck no longer reports unhealthy on a working install
 

@@ -25,8 +25,10 @@ An engine behavior release from the NEM 3.0 charging discussion in #21, plus a t
 - "SC committed, SOC rising — hold SC" compared SOC against the lowest reading in the last 90 minutes, so an EB-driven climb counted as SC holding its own and the engine stayed in SC while draining. The check now uses only the trailing run of self-consumption readings (at least 15 minutes).
 - At target near peak, the engine rode self-consumption into peak even when solar was below load, spending stored energy at a pre-peak rate. It now does so only when solar covers the load; otherwise TOU holds the charge until peak.
 
-### Reserve follows the aGate (#21)
-- Engine math used `BACKUP_RESERVE_PCT` from config everywhere, so it would stop discharging at 20% even if the aGate's self-consumption reserve was set lower. The engine now uses the aGate's live SC reserve (already recorded on every reading) and falls back to config only when it is unavailable.
+### Mode switches no longer reset your aGate reserve (#21)
+- **Root cause:** the cloud mode-switch call always carries a reserve SOC, which the aGate adopts for that mode. Engine switches sent `RESERVE_SOC_HOME` / `RESERVE_SOC_BACKUP` (undocumented settings, defaults 20% / 100%), and the override path did the same — so every switch silently reset any reserve the user had set in the Franklin app back to 20%. Same class of bug the Home Assistant integration fixed in richo/homeassistant-franklinwh#82.
+- **Fix:** before switching, the engine reads the aGate's current reserve for the target mode (`selfMinSoc` / `touMinSoc` / `backupMaxSoc`) and sends it back unchanged. An explicit `RESERVE_SOC_HOME` / `RESERVE_SOC_BACKUP` in `.env` still takes precedence for anyone who wants the engine to enforce a value; the old defaults apply only if the device read fails. Each switch logs which source the reserve came from.
+- Engine math also used `BACKUP_RESERVE_PCT` from config as the discharge floor, stopping discharge at 20% even when the aGate allowed lower. It now uses the aGate's live SC reserve from recent readings (`active_reserve_pct`, falling back to the legacy `self_reserve_pct`), with config as the last resort.
 
 ### Telemetry install UUID persistence
 - **Root cause:** the install UUID was persisted only through the dashboard consent modal. Installs that enabled telemetry with `TELEMETRY_ENABLED=true` in `.env` never wrote it, so every daily report arrived with a new UUID (one site accumulated 100+). A new UUID is now written to `data/install_uuid` on first use; an existing dashboard-consent UUID still takes precedence.
@@ -34,6 +36,8 @@ An engine behavior release from the NEM 3.0 charging discussion in #21, plus a t
 ### Other
 - Log lines that appended the uncapped plan target after a capped ceiling ("charge to 75% ... Grid charge ... to 89%", or "charge to 99% (not 99%)") now state one consistent target.
 - Docker healthcheck replaced: `pgrep` is not present in `python:3.11-slim`, so the container always reported unhealthy. It now probes the scheduler API (`/api/version`).
+- `modbus_discovery.py`: register 15507 map corrected to the hardware-verified 1-indexed values (1=Backup, 2=Self-Consumption, 3=TOU, 4=Manual). Only affected the discovery CLI output and one log line — the collector and mode verification already used the correct map.
+- Removed dead constant `EB_DEFERRAL_MIN_BUFFER_HOURS`.
 
 ### Credits
 Issues reported and analyzed in detail by **miztahsparklez** on #21.
