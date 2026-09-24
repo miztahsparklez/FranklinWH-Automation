@@ -73,6 +73,65 @@ docker exec franklin-automation python3 /app/scripts/migrate_v46.py --battery-ar
 
 Your `.env` and `rate_schedule.json` remain authoritative and required — the migration is additive. To change a setting later, edit `.env` (or the JSON), restart, and re-run the migration to refresh the store.
 
+### Helper Scripts (Optional)
+
+Two small scripts that wrap the routine update steps, contributed by **miztahsparklez** ([#27](https://github.com/mtnears/FranklinWH-Automation/issues/27)). Save them somewhere on your `PATH` (e.g. `/usr/local/bin/`) and make them executable with `chmod +x`. Set `REPO` to your clone location. `MIGRATE_ARGS` only matters if you have more than one solar array and haven't migrated yet — set it to `--battery-array <your-array-id>` for that first run (see above); later runs keep your existing array classification, so it can be left empty.
+
+Both rebuild before stopping the running container, so downtime is only the few seconds of `down`/`up`. The migration step warns instead of aborting if it reports an error.
+
+**`update-settings`** — apply `.env` / `rate_schedule.json` changes:
+
+```bash
+#!/bin/bash
+set -e
+
+REPO="/FranklinWH-Automation"
+MIGRATE_ARGS=""
+
+cd "$REPO" || { echo "Repo dir $REPO not found — edit REPO at the top of this script."; exit 1; }
+
+echo "Rebuilding images (no cache)..."
+docker compose build --no-cache
+
+echo "Restarting containers..."
+docker compose down
+docker compose up -d
+
+echo "Migrating settings..."
+docker exec franklin-automation python3 /app/scripts/migrate_v46.py $MIGRATE_ARGS || echo "WARN: migration reported an error — settings applied, but check the output above."
+
+echo "Done. Settings updated."
+```
+
+**`update-franklin`** — pull the latest release and redeploy:
+
+```bash
+#!/bin/bash
+set -e
+
+REPO="/FranklinWH-Automation"
+MIGRATE_ARGS=""
+
+cd "$REPO" || { echo "Repo dir $REPO not found — edit REPO at the top of this script."; exit 1; }
+
+echo "Pulling latest changes..."
+git pull
+
+echo "Rebuilding images (no cache)..."
+docker compose build --no-cache
+
+echo "Restarting containers..."
+docker compose down
+docker compose up -d
+
+echo "Running migrations..."
+docker exec franklin-automation python3 /app/scripts/migrate_v46.py $MIGRATE_ARGS || echo "WARN: migration reported an error — review the output above before relying on the update."
+
+echo "Done. FranklinWH Automation updated and running."
+```
+
+Check the [CHANGELOG](CHANGELOG.md) before running `update-franklin` across a major version — some releases need steps beyond a pull and rebuild.
+
 ### Fresh Install (from v3.5 / v4.0)
 
 The v4.1 data-layer rewrite touched nearly every script and replaced the entire storage layer. There is no supported in-place upgrade path from v3.5 or v4.0 — a fresh install is required.
