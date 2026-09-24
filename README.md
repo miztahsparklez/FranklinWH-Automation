@@ -10,43 +10,33 @@ Adaptive charging system that optimizes for Time-of-Use (TOU) electricity rates,
 
 ---
 
-## What's New in v4.4
+## What's New in v4.6
 
-### Three-Tier Rate Support — Peak / Partial-Peak / Off-Peak (v4.4.0)
+### v4.6.2 — Charging Behavior Fixes (September 2026)
 
-First-class support for three-tier rate plans (e.g., PG&E EV2-A) where partial-peak windows surround a sacred peak. A new **Priority 4.5** sits between peak protection (P4) and curtailment protection (P5):
+A round of engine fixes from the NEM 3.0 discussion in [#21](https://github.com/mtnears/FranklinWH-Automation/issues/21):
 
-- **Pre-peak partial-peak** (peak still ahead) — preserve battery so it can recharge before sacred peak; Self-Consumption only when SOC is comfortable, fall through to TOU when low
-- **Post-peak partial-peak** (peak already done) — free to discharge via Self-Consumption, peak is behind so no SOC floor concern
+- **Emergency Backup runs to completion.** Once grid charging starts before peak, it continues until `TAPER_CEILING_PCT` or peak instead of dropping out after one 30-minute cycle, then holds the charge in TOU for peak
+- **`SAFETY_MARGIN_HOURS` now works** as extra lead time before peak (it was previously ignored by the v4 engine)
+- **Taper ceiling applies to export systems too** — grid charging stops at the ceiling and solar fills the rest
+- **No pre-peak drain of grid-bought energy** — energy EB charged is held for peak, and the engine only rides self-consumption into peak when solar is covering the load
+- **Reserve follows your aGate** — the engine's discharge floor uses the aGate's live self-consumption reserve instead of `BACKUP_RESERVE_PCT` when available
+- **Telemetry fix** — installs that enabled telemetry through `.env` no longer report a new install ID every day
+- **Healthy container status** — the Docker healthcheck no longer reports unhealthy on a working install
 
-The branch decision uses a new `expensive_window_remaining_hours()` helper in `rate_schedule.py` that walks forward to find the next off-peak transition, plus `is_partial_peak()` and `is_expensive()` helpers. Two-tier plans continue to work unchanged — P4.5 is a no-op when no `partial_peak` tier is defined.
+Also new: optional [update helper scripts](#helper-scripts-optional) contributed by the community ([#27](https://github.com/mtnears/FranklinWH-Automation/issues/27)).
 
-The reference `rate_schedule.json` shipped with the project is now configured for PG&E EV2-A with CARE. Other plan examples (E-TOU-D, SMUD, SCE TOU-D-PRIME, Pepco R-TOU-P, ComEd) live in `data/rate_schedule.example.json`.
+### v4.6.1 (June 2026)
 
-### Per-Season Rate Auto-Switching (v4.4.1)
+Mode-detection fix for Franklin schedules with custom names — cloud-only users could have pre-peak charging silently skipped ([#21](https://github.com/mtnears/FranklinWH-Automation/issues/21)) — and a rewrite of the SolarEdge panel collector for SolarEdge's new authenticated API.
 
-`rate_schedule.json` gained an optional `seasons` block that overrides `tier_rates` and/or `windows` per calendar month:
+### v4.6.0 (June 2026)
 
-```json
-"seasons": [
-  {"name": "summer", "months": [6, 7, 8, 9],
-   "tier_rates": {"peak": 34.976, "partial_peak": 27.794, "off_peak": 14.663}},
-  {"name": "winter", "months": [10, 11, 12, 1, 2, 3, 4, 5],
-   "tier_rates": {"peak": 26.714, "partial_peak": 25.628, "off_peak": 14.663}}
-]
-```
-
-Plans where rates differ summer vs winter flip automatically on the seasonal boundary — no manual JSON edits required on June 1 / October 1. Closes a silent gap on three-tier plans: the existing `rate_history` DB-based switching only covered peak/off_peak, so `partial_peak` previously stayed frozen at whatever JSON last said when seasons changed. Backward compatible — configs without a `seasons` block work exactly as before.
-
-Validation warnings at startup catch common misconfig: overlapping months between seasons, missing month coverage, invalid month values, unknown tier names in `tier_rates`.
-
-### Version Banner Reads From VERSION File (v4.4.1)
-
-A new `scripts/version.py` helper reads from the repo-root `VERSION` file. The engine startup banner in `intelligence_log` now reads `FranklinWH Smart Decision Engine v4.4.1 Adaptive` dynamically — no more hardcoded version strings drifting from reality on release.
+Foundation release: a SQLite configuration store, one canonical rate resolver shared by the engine, dashboard and savings calculator (fixing stale peak windows after a season change, [#26](https://github.com/mtnears/FranklinWH-Automation/issues/26)), and a read-only **Settings** tab with Configuration Health checks. Upgrading from v4.1+ needs a one-time migration — see [Upgrading](#upgrading).
 
 ---
 
-For older releases — v4.3.1 (target-aware SC commit fix), v4.3 (cloud-only persistence), v4.2 (multi-window peaks, Data Export tab), v4.1 (SQLite migration) — see [CHANGELOG.md](CHANGELOG.md).
+For full details and older releases — v4.4 (three-tier rates, per-season auto-switching), v4.3 (cloud-only persistence), v4.2 (multi-window peaks, Data Export tab), v4.1 (SQLite migration) — see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
