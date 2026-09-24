@@ -61,9 +61,9 @@ RUN chmod +x /app/scripts/*.py
 # Set Python to run unbuffered for real-time logs
 ENV PYTHONUNBUFFERED=1
 
-# Health check - verify scheduler is running
+# Health check - verify the scheduler's API server is answering (pgrep is not in python:slim)
 HEALTHCHECK --interval=5m --timeout=30s --start-period=60s --retries=3 \
-    CMD pgrep -f "scheduler.py" || exit 1
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/api/version' % os.getenv('API_PORT','8101'), timeout=10)" || exit 1
 
 # Default command - run the scheduler
 CMD ["python", "/app/scripts/scheduler.py"]
