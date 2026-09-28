@@ -840,10 +840,12 @@ class SolarForecastEngine:
             import sqlite3
             db_path = os.path.join(self.cache_dir, 'franklin.db')
             conn = sqlite3.connect(db_path, timeout=10)
+            # Range on the raw column so idx_enphase_ts is used; date(timestamp)
+            # forced a full scan incl. panels_json (11s idle, 1-3 min under load).
             row = conn.execute(
                 "SELECT SUM(inverter_sum_w * 5.0 / 60.0) / 1000.0 "
-                "FROM enphase_readings WHERE date(timestamp) = ?",
-                (yesterday,)
+                "FROM enphase_readings WHERE timestamp >= ? AND timestamp < date(?, '+1 day')",
+                (yesterday, yesterday)
             ).fetchone()
             conn.close()
             if row and row[0]:

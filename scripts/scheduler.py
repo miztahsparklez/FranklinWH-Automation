@@ -95,7 +95,8 @@ def run_script(script_name: str, description: str):
     return run_script_with_args(script_name, [], description)
 
 
-def run_script_with_args(script_name: str, args: list, description: str):
+def run_script_with_args(script_name: str, args: list, description: str,
+                         timeout: int = 300):
     """Run a Python script with optional arguments and log the result."""
     script_path = SCRIPT_DIR / script_name
     
@@ -110,7 +111,7 @@ def run_script_with_args(script_name: str, args: list, description: str):
             [sys.executable, str(script_path)] + args,
             capture_output=True,
             text=True,
-            timeout=300,  # 5 minute timeout
+            timeout=timeout,
             cwd=str(SCRIPT_DIR)
         )
         
@@ -132,7 +133,7 @@ def run_script_with_args(script_name: str, args: list, description: str):
             return False
             
     except subprocess.TimeoutExpired:
-        log(f"FAIL {description}: Timed out after 5 minutes")
+        log(f"FAIL {description}: Timed out after {timeout}s")
         return False
     except Exception as e:
         log(f"FAIL {description}: Exception - {e}")
@@ -157,8 +158,12 @@ def job_smart_decision_peak_end():
 
 
 def job_dashboard_data():
-    """Dashboard data update - runs every minute."""
-    run_script("generate_dashboard_data.py", "Dashboard Data")
+    """Dashboard data update - runs every minute.
+
+    90s timeout (v4.6.3): the scheduler runs jobs serially, so a hung
+    dashboard run used to hold up everything behind it — including the
+    :00/:30 decision cycle — for the full 5 minutes."""
+    run_script_with_args("generate_dashboard_data.py", [], "Dashboard Data", timeout=90)
 
 
 def job_weather():
@@ -1523,14 +1528,16 @@ class APIHandler(BaseHTTPRequestHandler):
             end_str = params.get('end', [None])[0]
 
             if start_str and end_str:
-                date_clause = "date(timestamp) BETWEEN ? AND ?"
+                date_clause = "timestamp >= ? AND timestamp < date(?, '+1 day')"
                 date_params = (start_str, end_str)
                 weather_clause = "date BETWEEN ? AND ?"
+                weather_params = (start_str, end_str)
                 resp_date = f"{start_str}..{end_str}"
             elif date_str:
-                date_clause = "date(timestamp) = ?"
-                date_params = (date_str,)
+                date_clause = "timestamp >= ? AND timestamp < date(?, '+1 day')"
+                date_params = (date_str, date_str)
                 weather_clause = "date = ?"
+                weather_params = (date_str,)
                 resp_date = date_str
             else:
                 self._json_response(400, {'error': 'Missing ?date= or ?start=&end='})
@@ -1560,7 +1567,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"SELECT date, temp_high, temp_low, temp_avg, humidity_avg, "
                 "solar_radiation_high, precip_total, observation_count "
                 f"FROM weather_daily WHERE {weather_clause} ORDER BY date",
-                date_params
+                weather_params
             )
 
             self._json_response(200, {
@@ -1592,11 +1599,11 @@ class APIHandler(BaseHTTPRequestHandler):
             filt = params.get('filter', ['decisions'])[0]
 
             if start_str and end_str:
-                date_clause = "date(timestamp) BETWEEN ? AND ?"
+                date_clause = "timestamp >= ? AND timestamp < date(?, '+1 day')"
                 date_params = (start_str, end_str)
             elif date_str:
-                date_clause = "date(timestamp) = ?"
-                date_params = (date_str,)
+                date_clause = "timestamp >= ? AND timestamp < date(?, '+1 day')"
+                date_params = (date_str, date_str)
             else:
                 self._json_response(400, {'error': 'Missing ?date= or ?start=&end='})
                 return

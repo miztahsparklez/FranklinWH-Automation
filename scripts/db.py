@@ -1194,15 +1194,16 @@ def db_stats() -> Dict[str, Any]:
 def get_readings_for_date(date_str: str, device_id: str = 'agate_main') -> List[Dict[str, Any]]:
     """Get all system_readings for a specific date. Returns list of dicts."""
     return query(
-        "SELECT * FROM system_readings WHERE date(timestamp) = ? AND device_id = ? ORDER BY timestamp",
-        (date_str, device_id)
+        "SELECT * FROM system_readings WHERE timestamp >= ? AND timestamp < date(?, '+1 day') "
+        "AND device_id = ? ORDER BY timestamp",
+        (date_str, date_str, device_id)
     )
 
 
 def get_readings_range(start_date: str, end_date: str, device_id: str = 'agate_main') -> List[Dict[str, Any]]:
     """Get system_readings between two dates (inclusive). Returns list of dicts."""
     return query(
-        "SELECT * FROM system_readings WHERE date(timestamp) >= ? AND date(timestamp) <= ? "
+        "SELECT * FROM system_readings WHERE timestamp >= ? AND timestamp < date(?, '+1 day') "
         "AND device_id = ? ORDER BY timestamp",
         (start_date, end_date, device_id)
     )

@@ -18,6 +18,14 @@ v3.4 - Added extended status block with per-battery SOC, environment data,
 v3.5 - Switched from CSV reads to SQLite database queries.
 """
 
+# v4.6.3: arm the hang watch before any heavy import, so a stall during
+# interpreter startup (e.g. CPU starvation on the host) is traced too.
+try:
+    import hang_watch as _hang_watch
+    _hang_watch.arm('dashboard_data', 75)
+except Exception:
+    _hang_watch = None
+
 import json
 import sys
 from datetime import datetime, timedelta
@@ -673,4 +681,7 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    _rc = main()
+    if _hang_watch:
+        _hang_watch.disarm()
+    sys.exit(_rc)

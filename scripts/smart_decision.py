@@ -54,6 +54,14 @@ Changelog:
   v3.1.0 - Docker deployment, mode-aware savings tracking
   v3.0.0 - Configuration-driven with feature toggles
 """
+
+# v4.6.3: arm the hang watch before any heavy import, so a stall during
+# interpreter startup (e.g. CPU starvation on the host) is traced too.
+try:
+    import hang_watch as _hang_watch
+    _hang_watch.arm('smart_decision', 240)
+except Exception:
+    _hang_watch = None
 import asyncio
 from datetime import datetime, timedelta
 
@@ -1189,4 +1197,6 @@ async def main() -> int:
 
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
+    if _hang_watch:
+        _hang_watch.disarm()
     exit(exit_code)
