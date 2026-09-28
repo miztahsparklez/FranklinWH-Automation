@@ -241,26 +241,58 @@ def get_layout(session, site_id):
 
 
 def get_cached_layout(session, site_id):
-    """Get layout from cache or fetch fresh."""
+    """Get layout from cache or fetch fresh.
+
+    v4.6.3: SolarEdge retired the legacy basic-auth layout/logical endpoint
+    (410 Gone since ~2026-07-27) while the Cognito energy API still works.
+    Layout is only inventory (optimizer -> inverter/string), and energy is
+    keyed by optimizer serial, so when the live fetch fails we fall back to
+    the last cached layout regardless of age. A failed live refresh is retried
+    at most once per LAYOUT_CACHE_MAX_AGE to avoid a warning every cycle.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    cache = None
     if LAYOUT_CACHE.exists():
         try:
             cache = json.loads(LAYOUT_CACHE.read_text())
-            cache_age = time.time() - cache.get("cached_at", 0)
-            if cache_age < LAYOUT_CACHE_MAX_AGE:
-                logger.info(f"Using cached layout ({int(cache_age/3600)}h old, "
-                            f"{len(cache['optimizer_map'])} optimizers)")
-                return cache["optimizer_map"], cache["inverter_info"]
+            cache["optimizer_map"], cache["inverter_info"]
         except (json.JSONDecodeError, KeyError, IOError):
-            pass
+            cache = None
+
+    now = time.time()
+    if cache:
+        cache_age = now - cache.get("cached_at", 0)
+        retry_after = cache.get("live_retry_after", 0)
+        if cache_age < LAYOUT_CACHE_MAX_AGE or now < retry_after:
+            logger.info(f"Using cached layout ({int(cache_age/3600)}h old, "
+                        f"{len(cache['optimizer_map'])} optimizers)")
+            return cache["optimizer_map"], cache["inverter_info"]
 
     # Fetch fresh
-    optimizer_map, inverter_info = get_layout(session, site_id)
+    try:
+        if session is None:
+            raise RuntimeError("no portal session")
+        optimizer_map, inverter_info = get_layout(session, site_id)
+    except Exception as e:
+        if not cache:
+            raise
+        cache_age = now - cache.get("cached_at", 0)
+        logger.warning(
+            f"Live layout fetch failed ({e}); using cached layout "
+            f"({int(cache_age/86400)}d old, {len(cache['optimizer_map'])} optimizers). "
+            f"Next live attempt in {int(LAYOUT_CACHE_MAX_AGE/3600)}h.")
+        cache["live_retry_after"] = now + LAYOUT_CACHE_MAX_AGE
+        cache["last_live_error"] = str(e)[:200]
+        try:
+            LAYOUT_CACHE.write_text(json.dumps(cache, indent=2))
+        except IOError:
+            pass
+        return cache["optimizer_map"], cache["inverter_info"]
 
     # Cache it
     cache = {
-        "cached_at": time.time(),
+        "cached_at": now,
         "optimizer_map": optimizer_map,
         "inverter_info": inverter_info,
     }
@@ -728,8 +760,10 @@ def collect(config):
     try:
         session = portal_session(config["username"], config["password"])
     except Exception as e:
-        logger.error(f"Portal authentication failed: {e}")
-        return None
+        # Legacy portal login only serves the layout call; a cached layout
+        # can stand in for it (see get_cached_layout).
+        logger.warning(f"Legacy portal login failed ({e}); will try cached layout")
+        session = None
 
     try:
         opt_map, inverter_info = get_cached_layout(session, config["site_id"])
