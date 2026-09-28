@@ -4,6 +4,39 @@ All notable changes to FranklinWH Battery Automation.
 
 ---
 
+## v4.6.3 — September 2026
+
+Emergency Backup timing on three-tier rate plans. Engine and rate-schedule changes only (`adaptive_engine.py`, `rate_schedule.py`); no new settings.
+
+### EB charges in the cheap window, not the partial-peak shoulder
+- **Root cause:** EB's last-responsible-moment timing counted down to **peak start**. On plans with a partial-peak shoulder before peak (e.g. PG&E EV2-A, partial-peak 3–4pm, peak 4–9pm) that let EB defer into the shoulder, and at 3pm the cheapest rate "remaining before peak" was the partial-peak rate itself, so EB fired there. Most EB episodes since late August started at 3pm at the partial-peak rate.
+- **Fix:** EB now counts down to the close of the cheap window: the start of the contiguous partial-peak/peak run leading into peak, taken from each install's own rate schedule (`charge_deadline_before_peak()`). On two-tier plans that is the peak start, so behavior is unchanged. If the cheap window is missed, EB can still close a real gap before peak (partial-peak is cheaper than peak); those decisions are logged as "Cheap window missed".
+
+### EB charge-time estimate uses the observed EB rate
+- Charge time came from the learned grid-charge curve, which mixes in TOU drift and partial grid charging (≈8.6 kW on a 3-aPower system that actually charges at ≈15.9 kW in EB). It now uses the median of this install's own EB charging readings over the last 60 days, falling back to the learned curve with fewer than 10 samples. Without this, the earlier deadline would have started EB hours sooner than needed.
+
+### Same-cycle mode-switch cooldown
+- A switch proposed and superseded within the same 30-minute cycle (e.g. continuous-target's TOU, then the EB decision chained after it) started the 5-minute cooldown, turning the EB decision into a hold and delaying EB a full cycle. The cooldown now measures from the previous cycle's switch.
+
+### EB stops at its target between decision cycles
+- EB charges at about 1% SOC per minute, but decisions only run every 30 minutes. EB therefore kept charging past its target until the next cycle. On Sep 26 it reached 75% around 14:55 but kept charging to 79% until the 15:00 cycle, running into partial-peak.
+- While the engine holds EB toward a target, `smart_decision.py` now writes that target to `logs/eb_watch.json`. A new scheduler job, **EB Exit Watch**, runs every minute and reads SOC directly over Modbus (register 1037). Once SOC reaches the target, it runs one decision cycle early, and the engine's existing EB-complete logic returns TOU.
+- The job does nothing when no watch file exists. It triggers at most one early run per 5 minutes, discards watch files older than 3 hours, and only applies to engine-driven EB. Manual overrides, emergency prep and dynamic-pricing EB are excluded.
+
+### SolarEdge panel collector: cached-layout fallback
+- SolarEdge retired the legacy basic-auth `layout/logical` endpoint, which has returned `410 Gone` since about Jul 27. The collector fetches layout first, so it had failed on every run and stopped recording barn per-optimizer data. The Cognito per-optimizer energy API still works.
+- When the live layout fetch (or the legacy portal login) fails, the collector now uses the last cached layout, whatever its age. Layout is only inventory: which optimizer sits on which inverter and string. Energy data is matched by optimizer serial. The live fetch is retried at most once a day, with a single warning each time.
+- A proper fix will capture SolarEdge's replacement layout endpoint.
+
+### Scheduler stalls and job timeouts
+- **Root cause:** several queries filtered with `date(timestamp) = ?`, which prevents SQLite from using the timestamp index, so each call scanned the whole table. The worst was the solar forecast's "yesterday correction" on `enphase_readings` (including per-panel JSON), run every decision cycle: 11 s on an idle system and 1–3 minutes under load. Because the scheduler runs jobs one at a time, these stalls cascaded into 5-minute timeouts across Smart Decision, Dashboard Data and the collectors (≈3–10 a day).
+- **Fix:** the forecast query, the chart-data and intelligence-log API endpoints, and the `db.py` date helpers now use index-friendly ranges (`timestamp >= day AND timestamp < day + 1`). Results are identical.
+- Dashboard Data (runs every minute) now times out at 90 s instead of 5 minutes, so a hung run can't delay the :00/:30 decision cycle by more than that.
+- New `hang_watch.py`: if Smart Decision runs past 4 minutes (Dashboard Data past 75 s), the stack of every thread is appended to `logs/smart_decision_hang.txt` / `logs/dashboard_data_hang.txt`, so any remaining hang can be traced to the exact call. The watch starts on the scripts' first lines, before any heavy import, so it also catches stalls during start-up, for example when the host's CPU is saturated by other containers.
+- If other containers on the same host can saturate the CPU, give `franklin-automation` a higher `cpu_shares` in a local `docker-compose.override.yml` (e.g. `cpu_shares: 4096`; Docker's default is 1024) so the scheduler keeps priority.
+
+---
+
 ## v4.6.2 — September 2026
 
 An engine behavior release from the NEM 3.0 charging discussion in #21, plus a telemetry fix. All engine changes are in `adaptive_engine.py`; no new settings.
