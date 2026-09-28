@@ -449,6 +449,7 @@ class AdaptiveEngine:
         self.target_soc = target_soc
         self.config = config or {}
         self.last_mode_switch: Optional[datetime] = None
+        self._prior_mode_switch: Optional[datetime] = None
         self.last_decision: Optional[Decision] = None
 
         # Solar forecast engine (v4.0 forecast-aware charging)
@@ -2295,10 +2296,18 @@ class AdaptiveEngine:
             else:
                 action = "switch_to_self_consumption"
 
-        # Check cooldown (only meaningful for real mode changes)
+        # Check cooldown (only meaningful for real mode changes).
+        # A switch proposed earlier in THIS cycle (same state.timestamp) was
+        # superseded, never issued — measure against the previous cycle's
+        # switch instead. Otherwise CT's TOU proposal starts a 300s cooldown
+        # that turns the EB decision chained after it into a hold, delaying
+        # EB a full 30-minute cycle (Sep 10 / Sep 15: 14:30 → 15:03). (v4.6.3)
+        ref_switch = self.last_mode_switch
+        if ref_switch is not None and ref_switch == state.timestamp:
+            ref_switch = self._prior_mode_switch
         if action in ("switch_to_backup", "switch_to_self_consumption", "switch_to_tou"):
-            if self.last_mode_switch and self.last_decision and mode != state.current_mode:
-                elapsed = (state.timestamp - self.last_mode_switch).total_seconds()
+            if ref_switch and self.last_decision and mode != state.current_mode:
+                elapsed = (state.timestamp - ref_switch).total_seconds()
                 if elapsed < MODE_SWITCH_COOLDOWN_S:
                     action = "hold"
                     reason += f" (cooldown: {int(MODE_SWITCH_COOLDOWN_S - elapsed)}s remaining)"
@@ -2309,6 +2318,8 @@ class AdaptiveEngine:
         # legitimate follow-up evaluations (e.g. SC branch running before EB branch).
         if action in ("switch_to_backup", "switch_to_self_consumption", "switch_to_tou"):
             if mode != state.current_mode:
+                if self.last_mode_switch != state.timestamp:
+                    self._prior_mode_switch = self.last_mode_switch
                 self.last_mode_switch = state.timestamp
 
         decision = Decision(
