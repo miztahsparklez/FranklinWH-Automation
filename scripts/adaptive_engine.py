@@ -1770,6 +1770,8 @@ class AdaptiveEngine:
             'forecast_source': plan.forecast_source,
             'weather_score': plan.weather_score,
             'hours_to_peak': round(hours_to_peak, 1),
+            # EB exit target for the scheduler's between-cycle watch (v4.6.3)
+            'eb_target_pct': round(ceiling_pct, 1),
         }
 
         # Log suffix: plan.recommendation states the UNCAPPED ceiling, which
@@ -1980,6 +1982,7 @@ class AdaptiveEngine:
             'gap_kwh': round(gap_kwh, 1),
             'charge_time_hours': round(charge_time_hours, 2),
             'hours_to_peak': round(state.hours_to_peak, 1),
+            'eb_target_pct': round(target_soc, 1),
         }
 
         # EB commitment (see _evaluate_gap_with_plan)

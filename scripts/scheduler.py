@@ -157,6 +157,66 @@ def job_smart_decision_peak_end():
     run_script("smart_decision.py", "Smart Decision [post-peak]")
 
 
+_EB_WATCH_LAST_TRIGGER = None
+
+
+def _read_soc_modbus():
+    """Direct Modbus SOC read (register 1037, %x10). None on any failure."""
+    try:
+        from pymodbus.client import ModbusTcpClient
+        c = ModbusTcpClient(host=config.MODBUS_HOST, port=config.MODBUS_PORT, timeout=3)
+        if not c.connect():
+            return None
+        try:
+            r = c.read_holding_registers(1037, count=1)
+            if r.isError() or not r.registers:
+                return None
+            v = r.registers[0]
+            return v / 10.0 if 0 < v <= 1000 else None
+        finally:
+            c.close()
+    except Exception:
+        return None
+
+
+def job_eb_watch():
+    """EB exit watch (v4.6.3) - runs every minute, normally a no-op.
+
+    smart_decision leaves logs/eb_watch.json while the engine holds Emergency
+    Backup toward a target SOC. EB charges ~1%/min but decisions run every
+    30 min, so without this EB overshot its target by up to a full cycle
+    (Sep 26: 75% target reached ~14:55, EB ran to 79% until the 15:00 cycle).
+    When SOC reaches the target, run one decision cycle early; the engine's
+    EB-complete logic then returns TOU. At most one early run per 5 minutes.
+    """
+    global _EB_WATCH_LAST_TRIGGER
+    if not CONFIG_LOADED:
+        return
+    watch = Path(str(config.LOG_DIR)) / 'eb_watch.json'
+    if not watch.exists():
+        return
+    try:
+        w = json.loads(watch.read_text())
+        target = float(w['target_soc_pct'])
+        written = datetime.fromisoformat(w['written_at'])
+    except Exception:
+        watch.unlink(missing_ok=True)
+        return
+    now = datetime.now()
+    if now - written > timedelta(hours=3):
+        watch.unlink(missing_ok=True)
+        return
+    if _EB_WATCH_LAST_TRIGGER and now - _EB_WATCH_LAST_TRIGGER < timedelta(minutes=5):
+        return
+    soc = _read_soc_modbus() if getattr(config, 'MODBUS_ENABLED', False) else None
+    if soc is None or soc < target:
+        return
+    _EB_WATCH_LAST_TRIGGER = now
+    log(f"EB watch: SOC {soc:.1f}% >= target {target:.0f}% - running decision cycle early")
+    watch.unlink(missing_ok=True)
+    run_script("smart_decision.py", "Smart Decision [eb-target]")
+
+
 def job_dashboard_data():
     """Dashboard data update - runs every minute.
 
@@ -494,6 +554,10 @@ def setup_schedule():
     # Dashboard data - every minute
     schedule.every(1).minutes.do(job_dashboard_data)
     _register("Dashboard Data", "Every 1 minute")
+
+    # EB exit watch - no-op unless the engine is holding EB toward a target
+    schedule.every(1).minutes.do(job_eb_watch)
+    _register("EB Exit Watch", "Every 1 minute (only acts during engine EB)")
     
     # Weather — legacy collect_weather.py removed in Iteration 2
     # Weather data now comes exclusively from collect_weather_db.py (SQLite)

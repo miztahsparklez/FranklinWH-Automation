@@ -1077,6 +1077,27 @@ async def main() -> int:
         
         # Write mode to state file (logging only, not used for decisions)
         save_mode_log(desired_mode_label)
+
+        # EB exit watch (v4.6.3): decisions run every 30 min, but EB charges
+        # ~1% SOC/min, so it used to overshoot its target by up to a cycle.
+        # While the engine holds EB toward a target, leave that target for the
+        # scheduler's 1-minute watch, which triggers an early decision cycle
+        # once SOC reaches it. Cleared whenever the engine isn't charging.
+        try:
+            import json as _json_eb
+            _eb_watch = config.LOG_DIR / 'eb_watch.json'
+            _ld = adaptive_engine_instance.last_decision if ADAPTIVE_ENGINE_LOADED else None
+            _tgt = None
+            if should_charge and _ld is not None and _ld.mode == 'emergency_backup':
+                _tgt = (_ld.metrics or {}).get('eb_target_pct')
+            if _tgt is not None:
+                with open(_eb_watch, 'w') as f:
+                    _json_eb.dump({'target_soc_pct': float(_tgt),
+                               'written_at': datetime.now().isoformat(timespec='seconds')}, f)
+            elif _eb_watch.exists():
+                _eb_watch.unlink()
+        except Exception as e:
+            log_intelligence(f"EB watch file update failed (non-fatal): {e}")
         
         # Save data source health statistics
         data_manager.save_health_stats()
