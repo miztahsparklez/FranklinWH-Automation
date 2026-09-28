@@ -267,9 +267,42 @@ class RateSchedule:
             return None
         return (peak - dt).total_seconds() / 3600.0
 
-    def cheapest_rate_before_peak(self, dt: Optional[datetime] = None) -> Tuple[str, float]:
+    def charge_deadline_before_peak(self, dt: Optional[datetime] = None) -> Optional[datetime]:
+        """When the cheap pre-peak window closes: the start of the contiguous
+        expensive run (partial-peak and/or peak) that leads into the next peak.
+
+        Grid charging for peak should finish by this time. On a two-tier plan
+        there is no partial-peak shoulder, so this is simply the peak start.
+        On PG&E EV2-A (partial-peak 3-4pm, peak 4-9pm) it is 3pm.
+
+        If dt is already inside that shoulder the returned time is in the past;
+        callers treat that as "cheap window missed". Returns None if no peak
+        is found (same horizon as next_peak_start).
+        """
+        if dt is None:
+            dt = datetime.now()
+
+        peak_start = self.next_peak_start(dt)
+        if peak_start is None:
+            return None
+
+        step = timedelta(minutes=5)
+        limit = peak_start - timedelta(hours=12)
+        t = peak_start
+        while t > limit and self.is_expensive(t - step):
+            t -= step
+        # Refine to the minute (windows need not sit on 5-minute boundaries)
+        while t > limit and self.is_expensive(t - timedelta(minutes=1)):
+            t -= timedelta(minutes=1)
+        return t
+
+    def cheapest_rate_before_peak(self, dt: Optional[datetime] = None,
+                                  until: Optional[datetime] = None) -> Tuple[str, float]:
         """Find the cheapest rate tier between now and the next peak.
-        
+
+        until: optional earlier end of the scan (e.g. charge_deadline_before_peak)
+        so a partial-peak shoulder isn't mistaken for the cheapest remaining rate.
+
         Returns (tier_name, rate_cents). Used for deciding whether to charge now.
         """
         if dt is None:
@@ -279,6 +312,8 @@ class RateSchedule:
         if peak_start is None:
             # No peak coming — return current rate
             return self.current_tier(dt)
+        if until is not None and dt < until < peak_start:
+            peak_start = until
 
         cheapest_tier = None
         cheapest_rate = float('inf')

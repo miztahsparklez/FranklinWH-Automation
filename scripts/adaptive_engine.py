@@ -1666,6 +1666,40 @@ class AdaptiveEngine:
 
         return None
 
+    def _eb_charge_timing(self, state: SystemState, hours_to_peak: float) -> dict:
+        """Timing horizon for EB grid charging (v4.6.3).
+
+        EB used to count down to peak start. On three-tier plans that let the
+        last-responsible-moment logic defer into the partial-peak shoulder, so
+        EB routinely fired at 3pm on EV2-A at the partial-peak rate. The
+        horizon is now the close of the cheap window (the start of the
+        expensive run leading into peak), taken from this install's own rate
+        schedule. Two-tier plans are unchanged: deadline == peak start.
+
+        Returns dict with:
+          horizon_hours  — hours left to finish charging at the cheap rate
+                           (hours_to_peak once the cheap window is missed)
+          past_deadline  — already inside the pre-peak shoulder
+          cheapest_tier / cheapest_rate — cheapest rate from now to the deadline
+          deadline       — datetime or None
+        """
+        deadline = self.rates.charge_deadline_before_peak(state.timestamp)
+        if deadline is None:
+            tier, rate = self.rates.cheapest_rate_before_peak(state.timestamp)
+            return {'horizon_hours': hours_to_peak, 'past_deadline': False,
+                    'cheapest_tier': tier, 'cheapest_rate': rate, 'deadline': None}
+
+        hours_to_deadline = (deadline - state.timestamp).total_seconds() / 3600.0
+        if hours_to_deadline <= 0:
+            return {'horizon_hours': hours_to_peak, 'past_deadline': True,
+                    'cheapest_tier': state.current_tier,
+                    'cheapest_rate': state.current_rate_cents, 'deadline': deadline}
+
+        tier, rate = self.rates.cheapest_rate_before_peak(state.timestamp, until=deadline)
+        return {'horizon_hours': min(hours_to_deadline, hours_to_peak),
+                'past_deadline': False, 'cheapest_tier': tier,
+                'cheapest_rate': rate, 'deadline': deadline}
+
     def _evaluate_eb_gap(self, state: SystemState) -> Optional[Decision]:
         """EB gap charging — grid charges only what solar can't provide.
 
@@ -1782,11 +1816,22 @@ class AdaptiveEngine:
                 confidence=0.8, priority=7, action="switch_to_tou", metrics=metrics,
             )
 
-        if gap_kwh < 2.0 and state.solar_kw > 0.3 and hours_to_peak > 4:
+        timing = self._eb_charge_timing(state, hours_to_peak)
+        horizon = timing['horizon_hours']
+        if timing['deadline'] is not None:
+            metrics['charge_deadline'] = timing['deadline'].strftime('%H:%M')
+        metrics['charge_horizon_hours'] = round(horizon, 2)
+        if timing['past_deadline']:
+            metrics['past_charge_deadline'] = True
+        horizon_label = (f"cheap window ends {timing['deadline']:%H:%M}"
+                         if timing['deadline'] is not None and not timing['past_deadline']
+                         else "peak")
+
+        if gap_kwh < 2.0 and state.solar_kw > 0.3 and horizon > 4:
             return self._decide(
                 state, "time_of_use",
                 f"Small gap ({gap_kwh:.1f} kWh) with solar producing ({state.solar_kw:.1f} kW) "
-                f"and {hours_to_peak:.1f}h to peak — letting solar handle it",
+                f"and {horizon:.1f}h until {horizon_label} — letting solar handle it",
                 confidence=0.75, priority=7, action="switch_to_tou", metrics=metrics,
             )
 
@@ -1799,11 +1844,13 @@ class AdaptiveEngine:
                 metrics=metrics,
             )
 
-        cheapest_tier, cheapest_rate = self.rates.cheapest_rate_before_peak(state.timestamp)
-        if state.current_rate_cents <= cheapest_rate:
-            charge_time_hours = self.profile.time_to_charge_kwh(
-                state.soc_percent, ceiling_pct
-            ) if hasattr(self.profile, 'time_to_charge_kwh') else gap_kwh / 5.0
+        cheapest_tier, cheapest_rate = timing['cheapest_tier'], timing['cheapest_rate']
+        # Past the cheap window: no cheaper rate remains before peak, so a real
+        # gap is still worth closing now (partial-peak < peak). This path should
+        # be the exception — the deadline-based horizon starts EB before it.
+        late = ("Cheap window missed — " if timing['past_deadline'] else "")
+        if timing['past_deadline'] or state.current_rate_cents <= cheapest_rate:
+            charge_time_hours = self._eb_charge_time_hours(state, ceiling_pct, gap_kwh)
 
             if hours_to_peak <= PRE_PEAK_GATE_HOURS:
                 if state.current_mode != 'emergency_backup':
@@ -1829,7 +1876,7 @@ class AdaptiveEngine:
                         )
 
             safety_margin_hours = float(self.config.get('safety_margin_hours', 0.5))
-            buffer_hours = hours_to_peak - charge_time_hours
+            buffer_hours = horizon - charge_time_hours
 
             metrics['charge_time_hours'] = round(charge_time_hours, 2)
             metrics['buffer_hours'] = round(buffer_hours, 1)
@@ -1838,8 +1885,8 @@ class AdaptiveEngine:
             if buffer_hours > safety_margin_hours + 1.0:
                 return self._decide(
                     state, "time_of_use",
-                    f"Forecast gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
-                    f"but {buffer_hours:.1f}h buffer — "
+                    f"{late}Forecast gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
+                    f"but {buffer_hours:.1f}h buffer before {horizon_label} — "
                     f"no rush, deferring EB. Reassess next cycle.",
                     confidence=0.8, priority=7, action="switch_to_tou",
                     metrics=metrics,
@@ -1853,10 +1900,10 @@ class AdaptiveEngine:
                 hold_action = 'hold' if state.current_mode == hold_mode else 'switch_to_tou'
                 return self._decide(
                     state, hold_mode,
-                    f"Forecast gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
+                    f"{late}Forecast gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
                     f"but solar producing ({state.solar_kw:.1f} kW, "
                     f"{solar_contribution_pct:.0f}% of gap) with "
-                    f"{buffer_hours:.1f}h buffer — deferring to let solar fill",
+                    f"{buffer_hours:.1f}h buffer before {horizon_label} — deferring to let solar fill",
                     confidence=0.75, priority=7, action=hold_action,
                     metrics=metrics,
                 )
@@ -1866,19 +1913,19 @@ class AdaptiveEngine:
             # On low-solar days (rainy/overcast), 0.2 kW against a 13 kWh gap
             # should not prevent grid charging when the buffer is tight.
 
-            if charge_time_hours <= hours_to_peak:
+            if charge_time_hours <= horizon:
                 return self._decide(
                     state, "emergency_backup",
-                    f"Forecast gap: {gap_kwh:.1f} kWh → grid charge to {ceiling_pct:.0f}% "
+                    f"{late}Forecast gap: {gap_kwh:.1f} kWh → grid charge to {ceiling_pct:.0f}% "
                     f"(target {self.target_soc:.0f}%), solar fills the rest. "
-                    f"Buffer tight ({buffer_hours:.1f}h). {rec}",
+                    f"Buffer tight ({buffer_hours:.1f}h before {horizon_label}). {rec}",
                     confidence=0.85, priority=7, action="switch_to_backup",
                     metrics=metrics,
                 )
             else:
                 return self._decide(
                     state, "emergency_backup",
-                    f"Forecast gap: {gap_kwh:.1f} kWh, only {hours_to_peak:.1f}h to peak "
+                    f"{late}Forecast gap: {gap_kwh:.1f} kWh, only {horizon:.1f}h until {horizon_label} "
                     f"(need {charge_time_hours:.1f}h) — charging urgently to {ceiling_pct:.0f}%",
                     confidence=0.95, priority=7, action="switch_to_backup",
                     metrics=metrics,
@@ -1919,9 +1966,7 @@ class AdaptiveEngine:
         gap_kwh = target_kwh - current_kwh - net_solar_to_battery
 
         if gap_kwh > 0:
-            charge_time_hours = self.profile.time_to_charge_kwh(
-                state.soc_percent, target_soc
-            )
+            charge_time_hours = self._eb_charge_time_hours(state, target_soc, gap_kwh)
         else:
             charge_time_hours = 0
 
@@ -1968,17 +2013,26 @@ class AdaptiveEngine:
                 confidence=0.8, priority=7,
                 action="switch_to_tou", metrics=metrics,
             )
-        if gap_kwh < 2.0 and state.solar_kw > 0.3 and state.hours_to_peak > 4:
+        timing = self._eb_charge_timing(state, state.hours_to_peak)
+        horizon = timing['horizon_hours']
+        if timing['deadline'] is not None:
+            metrics['charge_deadline'] = timing['deadline'].strftime('%H:%M')
+        metrics['charge_horizon_hours'] = round(horizon, 2)
+        if timing['past_deadline']:
+            metrics['past_charge_deadline'] = True
+        late = ("Cheap window missed — " if timing['past_deadline'] else "")
+
+        if gap_kwh < 2.0 and state.solar_kw > 0.3 and horizon > 4:
             return self._decide(
                 state, "time_of_use",
                 f"Small gap ({gap_kwh:.1f} kWh) with solar producing ({state.solar_kw:.1f} kW) "
-                f"and {state.hours_to_peak:.1f}h to peak — letting solar handle it",
+                f"and {horizon:.1f}h of charge window left — letting solar handle it",
                 confidence=0.75, priority=7,
                 action="switch_to_tou", metrics=metrics,
             )
 
-        cheapest_tier, cheapest_rate = self.rates.cheapest_rate_before_peak(state.timestamp)
-        if state.current_rate_cents <= cheapest_rate:
+        cheapest_tier, cheapest_rate = timing['cheapest_tier'], timing['cheapest_rate']
+        if timing['past_deadline'] or state.current_rate_cents <= cheapest_rate:
             if state.hours_to_peak <= PRE_PEAK_GATE_HOURS:
                 if state.current_mode != 'emergency_backup':
                     metrics['pre_peak_gate'] = True
@@ -1998,13 +2052,13 @@ class AdaptiveEngine:
                     )
 
             safety_margin_hours = float(self.config.get('safety_margin_hours', 0.5))
-            buffer_hours = state.hours_to_peak - charge_time_hours
+            buffer_hours = horizon - charge_time_hours
             metrics['buffer_hours'] = round(buffer_hours, 1)
 
             if buffer_hours > safety_margin_hours + 1.0:
                 return self._decide(
                     state, "time_of_use",
-                    f"Charging gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
+                    f"{late}Charging gap ({gap_kwh:.1f} kWh, {charge_time_hours:.1f}h to charge) "
                     f"but {buffer_hours:.1f}h buffer — deferring EB.",
                     confidence=0.8, priority=7, action="switch_to_tou", metrics=metrics,
                 )
@@ -2013,15 +2067,15 @@ class AdaptiveEngine:
                     and buffer_hours > safety_margin_hours):
                 return self._decide(
                     state, "self_consumption",
-                    f"Charging gap ({gap_kwh:.1f} kWh) but solar producing "
+                    f"{late}Charging gap ({gap_kwh:.1f} kWh) but solar producing "
                     f"({state.solar_kw:.1f} kW) with {buffer_hours:.1f}h buffer — deferring",
                     confidence=0.75, priority=7, action="hold", metrics=metrics,
                 )
 
-            if charge_time_hours <= state.hours_to_peak:
+            if charge_time_hours <= horizon:
                 return self._decide(
                     state, "emergency_backup",
-                    f"Charging gap: {gap_kwh:.1f} kWh, buffer tight ({buffer_hours:.1f}h) "
+                    f"{late}Charging gap: {gap_kwh:.1f} kWh, buffer tight ({buffer_hours:.1f}h) "
                     f"— charging at {state.current_rate_cents}¢/kWh",
                     confidence=0.85, priority=7,
                     action="switch_to_backup", metrics=metrics,
@@ -2029,7 +2083,7 @@ class AdaptiveEngine:
             else:
                 return self._decide(
                     state, "emergency_backup",
-                    f"Charging gap: {gap_kwh:.1f} kWh, only {state.hours_to_peak:.1f}h to peak "
+                    f"{late}Charging gap: {gap_kwh:.1f} kWh, only {horizon:.1f}h of charge window left "
                     f"(need {charge_time_hours:.1f}h) — charging urgently",
                     confidence=0.95, priority=7,
                     action="switch_to_backup", metrics=metrics,
@@ -2051,6 +2105,52 @@ class AdaptiveEngine:
         import sqlite3
         db_path = os.path.join(os.getenv('DATA_DIR', '/app/data'), 'franklin.db')
         return sqlite3.connect(db_path, timeout=5)
+
+    def _eb_charge_rate_kw(self, state: SystemState) -> Optional[float]:
+        """Observed battery charge rate while in Emergency Backup (v4.6.3).
+
+        The learned grid-charge curve blends in TOU drift and partial grid
+        charging, so on Ken's 3-aPower system it implied ~8.6 kW while EB
+        actually charges at a flat ~15.9 kW. That doubled the estimated
+        charge time and, once EB timing counts down to the cheap-window close,
+        would start EB hours earlier than needed. Median of this install's own
+        EB charging readings over 60 days; None if fewer than 10 samples.
+        """
+        cached = getattr(self, '_eb_rate_cache', False)
+        if cached is not False:
+            return cached
+        rate = None
+        try:
+            conn = self._db_conn()
+            cutoff = (state.timestamp - timedelta(days=60)).strftime('%Y-%m-%d %H:%M:%S')
+            rows = conn.execute(
+                "SELECT -battery_kw FROM system_readings "
+                "WHERE timestamp >= ? AND mode = 'emergency_backup' "
+                "AND battery_kw < -1", (cutoff,)).fetchall()
+            conn.close()
+            vals = sorted(r[0] for r in rows if r[0] is not None)
+            if len(vals) >= 10:
+                rate = vals[len(vals) // 2]
+        except Exception as e:
+            logger.debug(f"EB charge rate lookup failed: {e}")
+        self._eb_rate_cache = rate
+        return rate
+
+    def _eb_charge_time_hours(self, state: SystemState, target_pct: float,
+                              gap_kwh: float) -> float:
+        """Hours for EB to take SOC to target_pct. Observed EB rate first,
+        then the learned grid curve, then a 5 kW default."""
+        rate = self._eb_charge_rate_kw(state)
+        if rate:
+            battery_kwh = self.config.get(
+                'battery_capacity_kwh',
+                getattr(getattr(self.profile, 'capacity', None),
+                        'total_capacity_kwh', 30.0))
+            kwh = max(0.0, target_pct - state.soc_percent) / 100.0 * battery_kwh
+            return kwh / rate
+        if hasattr(self.profile, 'time_to_charge_kwh'):
+            return self.profile.time_to_charge_kwh(state.soc_percent, target_pct)
+        return gap_kwh / 5.0
 
     def _backup_reserve_pct(self, state: SystemState) -> float:
         """Discharge floor used in engine math.
